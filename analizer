@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Analisador de Snapshots - Gera um relatório DOCX profissional a partir dos logs de snapshots.
-"""
-
 import os
 import json
 import logging
