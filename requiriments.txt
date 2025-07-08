@@ -1,0 +1,32 @@
+# Dependências principais
+pandas>=1.5.0
+numpy>=1.21.0
+python-binance>=1.0.19
+aiohttp>=3.8.0
+aiofiles>=22.1.0
+python-dateutil>=2.8.2
+pytz>=2022.7.1
+
+# Análise técnica
+ta>=0.10.0
+
+# Para logging
+colorama>=0.4.6
+
+# Para manipulação de dados
+scipy>=1.9.0
+
+# Para visualização (opcional, mas útil para análise)
+matplotlib>=3.6.0
+
+# Para manipulação avançada de datas
+pytz>=2022.7.1
+
+# Para serialização JSON
+ujson>=5.4.0
+
+# Para operações assíncronas
+nest-asyncio>=1.5.6
+
+# Para manipulação de caminhos de arquivo (Python < 3.9)
+pathlib2>=2.3.7
