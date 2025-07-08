@@ -74,11 +74,11 @@ FEE = 0.00075
 MIN_SCORE_IMPROVEMENT = 0.001
 
 # Parâmetros ajustados
-TAKE_PROFIT_FACTOR = 1.9
-STOP_LOSS_FACTOR = 2.4
-GRID_INTERVAL = 0.000027
-MAX_ALLOCATION_RATIO = 0.6
-MIN_ATR = 0.000022
+TAKE_PROFIT_FACTOR = 1.5
+STOP_LOSS_FACTOR = 2.0
+GRID_INTERVAL = 0.000026
+MAX_ALLOCATION_RATIO = 0.8
+MIN_ATR = 0.000011
 SYMBOLS = ['XRPUSDT', 'BTCUSDT', 'ETHUSDT']
 
 # Variáveis globais
@@ -544,7 +544,8 @@ def load_existing_snapshots():
             except Exception as e:
                 logging.error(f"Erro ao carregar snapshot {file}: {e}")
     TOP_RESULTS.sort(key=lambda x: x["score"], reverse=True)
-    TOP_RESULTS = TOP_RESULTS[:10]
+    # Manter apenas os 5 melhores snapshots
+    TOP_RESULTS = TOP_RESULTS[:5]
     scores_list = [f"{r['score']:.3f}" for r in TOP_RESULTS]
     logging.info(f"Carregados {len(TOP_RESULTS)} snapshots existentes: {scores_list}")
 
@@ -629,32 +630,69 @@ async def review_and_improve_script(iteration):
         logging.error(f"Erro de sintaxe ao revisar script: {e}")
         return False
 
-async def save_script_snapshot(iteration, score, total_profit):
+async def save_script_snapshot(iteration, score, total_profit, stats=None, trades=None):
     global TOP_RESULTS
-    logging.info(f"Tentando salvar snapshot: Iteração {iteration}, Score {score:.3f}, Lucro {total_profit}")
     
-    # Criar novo resultado
+    # Criar dicionário com as estatísticas do snapshot
+    snapshot_data = {
+        "iteration": iteration,
+        "score": score,
+        "total_profit": total_profit,
+        "timestamp": datetime.now().isoformat(),
+        "stats": stats or {},
+        "trades_summary": {
+            "total_trades": len(trades) if trades else 0,
+            "winning_trades": len([t for t in trades or [] if t.profit_usdt > 0]) if trades else 0,
+            "losing_trades": len([t for t in trades or [] if t.profit_usdt <= 0]) if trades else 0,
+            "total_fees": sum(t.fees for t in trades) if trades else 0,
+            "max_profit": max([t.profit_usdt for t in trades], default=0) if trades else 0,
+            "max_loss": min([t.profit_usdt for t in trades], default=0) if trades else 0,
+            "avg_profit_per_trade": (sum(t.profit_usdt for t in trades) / len(trades)) if trades and len(trades) > 0 else 0
+        },
+        "parameters": {
+            "TAKE_PROFIT_FACTOR": TAKE_PROFIT_FACTOR,
+            "STOP_LOSS_FACTOR": STOP_LOSS_FACTOR,
+            "GRID_INTERVAL": GRID_INTERVAL,
+            "MAX_ALLOCATION_RATIO": MAX_ALLOCATION_RATIO,
+            "MIN_ATR": MIN_ATR,
+            "MIN_LIQUIDITY_RATIO": MIN_LIQUIDITY_RATIO
+        }
+    }
+    
+    # Nome do arquivo baseado no score e iteração
+    snapshot_filename = f"snapshot_{iteration}_score_{score:.3f}.json"
+    snapshot_filepath = os.path.join(SNAPSHOT_DIR, snapshot_filename)
+    
+    # Salvar os dados do snapshot
+    async with aiofiles.open(snapshot_filepath, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(snapshot_data, indent=2, default=str))
+    
+    # Atualizar a lista de TOP_RESULTS
     new_result = {
         "iteration": iteration,
         "score": score,
-        "snapshot_file": os.path.join(SNAPSHOT_DIR, f"top_{iteration}_score_{score:.3f}.py")
+        "snapshot_file": snapshot_filepath,
+        "total_profit": total_profit,
+        "stats": stats or {}
     }
     
-    # Adicionar à lista e manter os 10 melhores
     TOP_RESULTS.append(new_result)
     TOP_RESULTS.sort(key=lambda x: x["score"], reverse=True)
-    if len(TOP_RESULTS) > 10:
-        worst = TOP_RESULTS.pop()
-        if os.path.exists(worst["snapshot_file"]):
-            os.remove(worst["snapshot_file"])
-            logging.info(f"Removido snapshot com score mais baixo: {worst['snapshot_file']}")
     
-    # Salvar o novo snapshot
-    script_content = open(__file__, 'r', encoding='utf-8').read()
-    async with aiofiles.open(new_result["snapshot_file"], 'w', encoding='utf-8') as f:
-        await f.write(script_content)
-    logging.info(f"Snapshot salvo: {new_result['snapshot_file']}, Score {score:.3f}")
-    return new_result["snapshot_file"]
+    # Manter apenas os 5 melhores
+    if len(TOP_RESULTS) > 5:
+        # Remove os snapshots extras (do 6º em diante)
+        while len(TOP_RESULTS) > 5:
+            worst = TOP_RESULTS.pop()
+            if os.path.exists(worst["snapshot_file"]):
+                try:
+                    os.remove(worst["snapshot_file"])
+                    logging.info(f"Removido snapshot com score mais baixo: {worst['snapshot_file']}")
+                except Exception as e:
+                    logging.error(f"Erro ao remover snapshot antigo: {e}")
+    
+    logging.info(f"Snapshot salvo: {snapshot_filepath}, Score {score:.3f}, Lucro: {total_profit:.2f} USDT")
+    return snapshot_filepath
 
 async def optimize_parameters(stats, total_trades, backtest_trades, iteration, total_profit, win_rate, execution_time, cumulative_invested, total_fees_sum, avg_trades_per_day, avg_profit_per_day, max_profit_trade, max_loss_trade):
     global TAKE_PROFIT_FACTOR, STOP_LOSS_FACTOR, GRID_INTERVAL, MAX_ALLOCATION_RATIO, MIN_ATR, TOP_RESULTS, RECENT_PERFORMANCE, best_profit, stagnation_counter, previous_profit, previous_avg, last_report, RECENT_PROFITS
@@ -668,7 +706,7 @@ async def optimize_parameters(stats, total_trades, backtest_trades, iteration, t
         logging.info(f"Checkpoint {iteration}: Top 10 Scores: {scores_list}")
     
     # Salvar snapshot em todas as iterações
-    await save_script_snapshot(iteration, score, total_profit)
+    await save_script_snapshot(iteration, score, total_profit, stats, backtest_trades)
     
     if stats["profit"] > best_profit:
         best_profit = stats["profit"]
