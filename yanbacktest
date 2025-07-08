@@ -1,0 +1,843 @@
+import sys
+import platform
+import asyncio
+
+# Configuração específica para Windows
+if platform.system() == 'Windows':
+    if sys.version_info >= (3, 8):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    else:
+        # Para versões mais antigas do Python
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+import pandas as pd
+import numpy as np
+import aiohttp
+from binance.client import Client
+import time
+import logging
+import os
+import pytz
+import json
+import aiofiles
+from datetime import datetime, timedelta
+from collections import deque
+import random
+import shutil
+import re
+
+# Obtém o diretório onde o script está localizado
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Constantes de diretório - agora usando caminhos absolutos
+CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
+SNAPSHOT_DIR = os.path.join(SCRIPT_DIR, "snapshots")
+BACKUP_FILE = os.path.join(SCRIPT_DIR, "grind_backup.py")
+
+# Criação de diretórios
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Loga os diretórios para depuração
+logging.info(f"Diretório do script: {SCRIPT_DIR}")
+logging.info(f"Cache dir: {CACHE_DIR}")
+logging.info(f"Snapshot dir: {SNAPSHOT_DIR}")
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[logging.FileHandler(os.path.join(SNAPSHOT_DIR, "debug.txt"), mode='w')],
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Credenciais da API
+API_KEY = "gYMmHFaizdwD8oP1gxUjGcABlnph4cR0KhcRQRnLGcrhm0KRhDoYfj6sUr7wHh07"
+API_SECRET = "WA4qLEePvsCgiOcDulogUuVlqOWkwnyiVFNQvmAmum8TMp4WMWXkXjIpbVK1Jbbq"
+client = Client(API_KEY, API_SECRET)
+
+# Constantes
+TARGET_TOTAL_PROFIT = 50.0
+TARGET_WIN_RATE = 0.60
+TARGET_TRADES_PER_DAY = 50
+MAX_TIME = 3
+CHECKPOINT_INTERVAL = 5
+DEEP_ANALYSIS_INTERVAL = 10
+TOP_ANALYSIS_INTERVAL = 25
+SCRIPT_REVIEW_INTERVAL = 50
+STAGNATION_THRESHOLD = 20
+RANDOMIZATION_INTERVAL = 15
+MAX_TRADE_ALLOCATION = 0.05
+MAX_PROFIT_THRESHOLD = 50  # Por trade
+MIN_LIQUIDITY_RATIO = 0.2  # 20% do saldo inicial deve permanecer líquido
+MIN_VOLUME = 1
+FEE = 0.00075
+MIN_SCORE_IMPROVEMENT = 0.001
+
+# Parâmetros ajustados
+TAKE_PROFIT_FACTOR = 1.9
+STOP_LOSS_FACTOR = 2.4
+GRID_INTERVAL = 0.000027
+MAX_ALLOCATION_RATIO = 0.6
+MIN_ATR = 0.000022
+SYMBOLS = ['XRPUSDT', 'BTCUSDT', 'ETHUSDT']
+
+# Variáveis globais
+current_balance = 0
+SYMBOL_FILTERS = {}
+TOP_RESULTS = []
+RECENT_PERFORMANCE = []
+RECENT_PROFITS = deque(maxlen=10)
+Q_TABLE = {}
+best_profit = 0
+best_score = 0
+stagnation_counter = 0
+previous_profit = 0
+previous_avg = 0
+last_report = ""
+data_loaded = False
+
+# Classe Trade
+class Trade:
+    def __init__(self, symbol, quantity, entry_price, timestamp, atr, trend_strength, strategy="aggressive"):
+        self.symbol = symbol
+        filters = SYMBOL_FILTERS[symbol]
+        quantity = round(quantity / filters['stepSize']) * filters['stepSize']
+        self.quantity = min(quantity, 1000)
+        self.entry_price = round(entry_price / filters['tickSize']) * filters['tickSize']
+        self.timestamp = datetime.fromtimestamp(timestamp)
+        self.exit_price = None
+        self.status = 'open'
+        self.entry_cost = self.entry_price * self.quantity
+        self.atr = atr
+        self.trend_strength = trend_strength
+        self.strategy = strategy
+        self.take_profit = round(self.entry_price * (1 + TAKE_PROFIT_FACTOR * atr / self.entry_price * (1 + trend_strength)) / filters['tickSize']) * filters['tickSize']
+        self.stop_loss = round(self.entry_price * (1 - STOP_LOSS_FACTOR * atr / self.entry_price) / filters['tickSize']) * filters['tickSize']
+        self.trailing_stop = self.stop_loss
+        self.profit_usdt = 0
+        self.fees = 0
+        self.highest_price = self.entry_price
+
+    def close(self, exit_price, volume, sma, atr):
+        try:
+            filters = SYMBOL_FILTERS[self.symbol]
+            
+            # Garantir que os valores de entrada sejam válidos
+            exit_price = max(0.00001, float(exit_price))  # Preço mínimo de 0.00001
+            volume = max(0, float(volume))
+            sma = max(0.00001, float(sma))  # SMA mínimo de 0.00001
+            atr = max(0, float(atr))  # ATR não pode ser negativo
+            
+            # Arredondar o preço de saída
+            if 'tickSize' in filters and filters['tickSize'] > 0:
+                exit_price = round(exit_price / filters['tickSize']) * filters['tickSize']
+            
+            # Calcular slippage com verificação de divisão por zero
+            quantity_total = max(0.00000001, self.quantity + volume)  # Evitar divisão por zero
+            slippage_factor = min(0.01, self.quantity / quantity_total)
+            slippage = Q_TABLE.get((self.symbol, self.strategy), 0.5) * exit_price * slippage_factor * np.random.choice([-1, 1])
+            
+            # Calcular preço de saída final
+            self.exit_price = exit_price + slippage
+            if 'tickSize' in filters and filters['tickSize'] > 0:
+                self.exit_price = round(self.exit_price / filters['tickSize']) * filters['tickSize']
+            
+            # Garantir que o preço de saída seja positivo
+            self.exit_price = max(0.00001, self.exit_price)
+            
+            # Calcular valor de saída e taxas
+            exit_value = self.exit_price * self.quantity
+            self.fees = max(0, (self.entry_cost + exit_value) * FEE)  # Taxas não podem ser negativas
+
+            # Calcular força da tendência com verificação de divisão por zero
+            trend_strength = (exit_price - sma) / max(0.00001, sma)  # Evitar divisão por zero
+            
+            # Calcular take profit dinâmico com verificação de divisão por zero
+            price_factor = atr / max(0.00001, self.entry_price)  # Evitar divisão por zero
+            dynamic_take_profit = self.entry_price * (1 + TAKE_PROFIT_FACTOR * price_factor * (1 + trend_strength))
+            
+            # Atualizar take profit e trailing stop
+            self.take_profit = max(self.take_profit, dynamic_take_profit)
+            self.highest_price = max(self.highest_price, exit_price)
+            self.trailing_stop = max(self.trailing_stop, self.highest_price - atr * STOP_LOSS_FACTOR)
+
+            # Verificar condições de fechamento
+            if exit_price >= self.take_profit or exit_price <= self.trailing_stop:
+                self.profit_usdt = exit_value - self.entry_cost - self.fees
+                
+                # Limitar o lucro máximo
+                if self.profit_usdt > MAX_PROFIT_THRESHOLD:
+                    self.profit_usdt = MAX_PROFIT_THRESHOLD
+                
+                self.status = 'closed'
+                
+                # Atualizar Q-table com verificação de divisão por zero
+                state = (self.symbol, self.strategy)
+                if abs(self.entry_cost) > 0.000001:  # Evitar divisão por zero
+                    reward = self.profit_usdt / self.entry_cost + 0.2 * (self.profit_usdt > 0)
+                    Q_TABLE[state] = Q_TABLE.get(state, 0.5) + 0.6 * (reward - Q_TABLE.get(state, 0.5))
+                
+            return self.status == 'closed'
+            
+        except Exception as e:
+            logging.error(f"Erro ao fechar trade {self.symbol}: {str(e)}")
+            self.status = 'closed'  # Forçar fechamento em caso de erro
+            return True
+
+# Funções auxiliares
+async def get_initial_balance():
+    global current_balance
+    current_balance = 50.0
+    return current_balance
+
+async def get_symbol_filters(symbol):
+    global SYMBOL_FILTERS
+    if symbol not in SYMBOL_FILTERS:
+        try:
+            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    exchange_info = await response.json()
+            for s in exchange_info['symbols']:
+                if s['symbol'] == symbol:
+                    filters = {
+                        'minNotional': 100.0 if symbol == "BTCUSDT" else 20.0 if symbol == "ETHUSDT" else 1.0,
+                        'stepSize': 0.1,
+                        'tickSize': 0.00001
+                    }
+                    for f in s['filters']:
+                        if f['filterType'] == 'MIN_NOTIONAL' and 'minNotional' in f:
+                            filters['minNotional'] = float(f['minNotional'])
+                        elif f['filterType'] == 'LOT_SIZE' and 'stepSize' in f:
+                            filters['stepSize'] = float(f['stepSize'])
+                        elif f['filterType'] == 'PRICE_FILTER' and 'tickSize' in f:
+                            filters['tickSize'] = float(f['tickSize'])
+                    SYMBOL_FILTERS[symbol] = filters
+                    logging.info(f"Filtros obtidos para {symbol}: {filters}")
+                    return SYMBOL_FILTERS[symbol]
+            raise ValueError(f"Símbolo {symbol} não encontrado na API de futuros")
+        except Exception as e:
+            logging.error(f"Erro ao obter filtros para {symbol}: {e}")
+            raise ValueError(f"Não foi possível obter filtros para {symbol}")
+    return SYMBOL_FILTERS[symbol]
+
+async def fetch_klines(symbol, session, start_time, end_time):
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": "1m", "startTime": int(start_time * 1000), "endTime": int(end_time * 1000), "limit": 1000}
+    async with session.get(url, params=params) as response:
+        data = await response.json()
+        return data
+
+def calculate_indicators(df):
+    close = df["close"].values
+    high = df["high"].values
+    low = df["low"].values
+    tr = np.maximum(high - low, np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1)))
+    atr = pd.Series(tr).rolling(5).mean().fillna(0).values
+    sma = pd.Series(close).rolling(10).mean().fillna(close[0]).values
+    df["atr"] = atr
+    df["sma"] = sma
+    return df[10:].reset_index(drop=True)
+
+async def get_historical_data(symbol):
+    global data_loaded
+    cache_file = os.path.join(CACHE_DIR, f"{symbol}_1m.csv")
+    start_date = pd.Timestamp("2025-02-01 00:00:00", tz=pytz.UTC)
+    end_date = pd.Timestamp("2025-02-28 23:59:59", tz=pytz.UTC)
+    logging.info(f"Carregando dados para {symbol} entre {start_date} e {end_date}")
+
+    if os.path.exists(cache_file) and data_loaded:
+        df = pd.read_csv(cache_file, parse_dates=["time"])
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        filtered_df = df[df["time"].between(start_date, end_date)].copy()
+        logging.info(f"Dados carregados do cache para {symbol}: {len(filtered_df)} linhas")
+        return filtered_df
+
+    if os.path.exists(cache_file):
+        os.remove(cache_file)
+        logging.info(f"Cache antigo removido para {symbol}")
+
+    logging.info(f"Buscando dados históricos de {symbol} da API")
+    all_klines = []
+    current_start = start_date.timestamp()
+    end_time = end_date.timestamp()
+    async with aiohttp.ClientSession() as session:
+        while current_start < end_time:
+            klines = await fetch_klines(symbol, session, current_start, end_time)
+            if not klines:
+                logging.warning(f"Nenhum dado retornado pela API para {symbol}")
+                break
+            all_klines.extend(klines)
+            current_start = pd.to_datetime(klines[-1][0], unit='ms', utc=True).timestamp() + 60
+        if not all_klines:
+            raise ValueError(f"Nenhum dado histórico disponível para {symbol}")
+        df = pd.DataFrame(all_klines, columns=["time", "open", "high", "low", "close", "volume", "close_time",
+                                              "quote_asset_volume", "trades", "taker_base", "taker_quote", "ignore"])
+        df["time"] = pd.to_datetime(df["time"], unit='ms', utc=True)
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = calculate_indicators(df)
+        filtered_df = df[df["time"].between(start_date, end_date)].copy()
+        
+        min_price, max_price = filtered_df["close"].min(), filtered_df["close"].max()
+        logging.info(f"Preços calculados para {symbol}: min={min_price}, max={max_price}")
+        if np.isnan(min_price) or np.isnan(max_price):
+            logging.error(f"Preços NaN retornados pela API para {symbol}")
+            raise ValueError(f"Preços NaN retornados para {symbol}")
+        if symbol == "XRPUSDT" and (min_price < 0.1 or max_price > 5):
+            logging.error(f"Preços inválidos para {symbol}: min={min_price}, max={max_price}")
+            raise ValueError(f"Preços fora da faixa realista para {symbol}")
+        elif symbol == "BTCUSDT" and (min_price < 20000 or max_price > 150000):
+            logging.error(f"Preços inválidos para {symbol}: min={min_price}, max={max_price}")
+            raise ValueError(f"Preços fora da faixa realista para {symbol}")
+        elif symbol == "ETHUSDT" and (min_price < 1000 or max_price > 5000):
+            logging.error(f"Preços inválidos para {symbol}: min={min_price}, max={max_price}")
+            raise ValueError(f"Preços fora da faixa realista para {symbol}")
+        
+        df.to_csv(cache_file, index=False)
+        data_loaded = True
+        logging.info(f"Dados salvos para {symbol}: {len(df)} linhas totais, {len(filtered_df)} linhas após filtro")
+        return filtered_df
+
+def calculate_trade_quantity(symbol, price, available):
+    filters = SYMBOL_FILTERS[symbol]
+    if price <= 0:
+        logging.warning(f"Preço inválido ({price}) para {symbol}, pulando cálculo de quantidade")
+        return 0
+        
+    min_quantity = filters['minNotional'] / price
+    allocated = available * MAX_TRADE_ALLOCATION
+    max_quantity = min(allocated / (price * (1 + FEE)), available / (price * (1 + FEE)))
+    quantity = max(min_quantity, min(max_quantity, allocated / (price * (1 + FEE))))
+    quantity = round(quantity / filters['stepSize']) * filters['stepSize']
+    if quantity < 0:
+        quantity = 0
+    total_cost = quantity * price * (1 + FEE)
+    if quantity >= min_quantity and total_cost <= available and total_cost >= filters['minNotional']:
+        return quantity
+    return 0
+
+def evaluate_symbol(close, atr, volume, sma, symbol_profit=0):
+    try:
+        # Garantir que os arrays tenham o mesmo comprimento
+        min_length = min(len(close), len(atr), len(volume), len(sma))
+        if min_length == 0:
+            return np.array([])
+            
+        close = close[-min_length:]
+        atr = atr[-min_length:]
+        volume = volume[-min_length:]
+        sma = sma[-min_length:]
+        
+        # Inicializar scores com zeros
+        scores = np.zeros_like(close, dtype=float)
+        
+        # Criar máscara para valores válidos
+        mask = (atr >= MIN_ATR) & (volume >= MIN_VOLUME) & (close > 0) & (sma > 0) & (close > sma)
+        
+        # Calcular scores com verificações de segurança
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Score de volatilidade (ATR normalizado pelo preço)
+            volatility_score = np.divide(atr, close, out=np.zeros_like(atr), where=(close > 0))
+            
+            # Score de volume (normalizado pela média móvel de 3 períodos)
+            if len(volume) >= 3:
+                volume_ma = np.convolve(volume, np.ones(3)/3, mode='valid')
+                # Preencher o início com NaN para manter o mesmo comprimento
+                volume_ma = np.concatenate((np.full(2, np.nan), volume_ma))
+                volume_score = np.divide(volume, volume_ma, out=np.ones_like(volume), where=(volume_ma > 0))
+            else:
+                volume_score = np.ones_like(volume)
+            
+            # Fator de lucro (normalizado pelo último preço)
+            profit_factor = np.zeros_like(close)
+            if len(close) > 0 and close[-1] > 0:
+                profit_factor = np.full_like(close, max(0, float(symbol_profit)) / close[-1])
+            
+            # Força da tendência (preço em relação à média móvel)
+            trend_strength = np.divide(close - sma, sma, out=np.zeros_like(close), where=(sma > 0))
+            
+            # Calcular score final apenas para os pontos válidos
+            valid_scores = (
+                volatility_score * 0.3 + 
+                volume_score * 0.3 + 
+                profit_factor * 0.2 + 
+                trend_strength * 0.2
+            )
+            
+            # Aplicar máscara para manter apenas os scores válidos
+            scores[mask] = valid_scores[mask]
+            
+            # Garantir que os scores estejam dentro de uma faixa razoável
+            scores = np.clip(scores, 0, 10)  # Limitar entre 0 e 10
+            
+        return scores
+        
+    except Exception as e:
+        logging.error(f"Erro em evaluate_symbol: {str(e)}")
+        return np.zeros_like(close) if 'close' in locals() else np.array([])
+
+async def backtest_strategy():
+    global current_balance
+    await asyncio.gather(*(get_symbol_filters(symbol) for symbol in SYMBOLS))
+    dataframes = await asyncio.gather(*(get_historical_data(symbol) for symbol in SYMBOLS))
+    symbol_data = {SYMBOLS[i]: df for i, df in enumerate(dataframes) if not df.empty}
+    
+    if not symbol_data:
+        logging.error("Nenhum dado histórico carregado")
+        return 0, 0, "", 0, {}, 0, [], {}, 0, 0, 0, 0, 0, 0
+
+    initial_balance = await get_initial_balance()
+    logging.info(f"Saldo inicial: {initial_balance}")
+    balance = initial_balance
+    total_invested = 0
+    cumulative_invested = 0
+    total_fees = {symbol: 0 for symbol in SYMBOLS}
+    total_profit = 0
+    backtest_trades = []
+    open_orders = {symbol: [] for symbol in SYMBOLS}
+    daily_trades = {}
+
+    min_length = min(len(df) for df in symbol_data.values())
+    total_days = max(1, min_length // 1440)
+    scores = np.array([evaluate_symbol(symbol_data[s]["close"].values[:min_length], 
+                                      symbol_data[s]["atr"].values[:min_length], 
+                                      symbol_data[s]["volume"].values[:min_length],
+                                      symbol_data[s]["sma"].values[:min_length],
+                                      0) 
+                      for s in SYMBOLS])
+
+    start_time = time.time()
+    for index in range(min_length):
+        if time.time() - start_time > MAX_TIME:
+            break
+
+        day = symbol_data[SYMBOLS[0]].iloc[index]["time"].date()
+        daily_trades[day] = daily_trades.get(day, 0)
+
+        symbol_indices = np.argsort(-scores[:, index])
+        available = min(balance * MAX_ALLOCATION_RATIO - total_invested, 500 - total_invested)
+        min_liquidity = initial_balance * MIN_LIQUIDITY_RATIO
+        if balance < min_liquidity:
+            break
+
+        for symbol_idx in symbol_indices:
+            symbol = SYMBOLS[symbol_idx]
+            score = scores[symbol_idx, index]
+            if score <= 0:
+                continue
+            df = symbol_data[symbol]
+            row = df.iloc[index]
+            price = row["close"]
+            atr = row["atr"]
+            sma = row["sma"]
+            volume = row["volume"]
+            timestamp = row["time"].timestamp()
+
+            # Fechar ordens existentes
+            for trade in open_orders[symbol][:]:
+                if trade.status == 'open':
+                    if trade.close(price, volume, sma, atr):
+                        balance += trade.profit_usdt + trade.entry_cost
+                        total_fees[symbol] += trade.fees
+                        total_profit += trade.profit_usdt
+                        backtest_trades.append(trade)
+                        open_orders[symbol].remove(trade)
+                        total_invested -= trade.entry_cost
+
+            # Abrir novas ordens com controle de liquidez
+            if available > SYMBOL_FILTERS[symbol]['minNotional'] and total_invested < 500 and balance > min_liquidity and price > 0:
+                trend_strength = (price - sma) / sma if sma > 0 else 0
+                grid_size = max(GRID_INTERVAL, atr * 0.05) if atr > 0 else GRID_INTERVAL
+                buy_prices = [round(price * (1 - i * grid_size) / SYMBOL_FILTERS[symbol]['tickSize']) * SYMBOL_FILTERS[symbol]['tickSize'] for i in range(3)]
+                # Garantir que os preços sejam positivos
+                buy_prices = [p for p in buy_prices if p > 0]
+                if not buy_prices:  # Se todos os preços forem inválidos, usar o preço atual
+                    buy_prices = [price]
+                for buy_price in buy_prices:
+                    quantity = calculate_trade_quantity(symbol, buy_price, available)
+                    total_cost = quantity * buy_price * (1 + FEE)
+                    if quantity > 0 and balance >= total_cost + min_liquidity and (total_invested + total_cost) <= 500:
+                        strategy = "aggressive" if Q_TABLE.get((symbol, "aggressive"), 0.5) > random.random() else "conservative"
+                        trade = Trade(symbol, quantity, buy_price, timestamp, atr, trend_strength, strategy)
+                        open_orders[symbol].append(trade)
+                        cumulative_invested += trade.entry_cost
+                        total_invested += trade.entry_cost
+                        balance -= trade.entry_cost
+                        daily_trades[day] += 1
+                        available -= trade.entry_cost
+                    if available <= SYMBOL_FILTERS[symbol]['minNotional'] or total_invested >= 500 or balance <= min_liquidity:
+                        break
+
+    # Fechar ordens pendentes
+    for symbol in SYMBOLS:
+        for trade in open_orders[symbol][:]:
+            if trade.status == 'open':
+                final_price = max(0.00001, symbol_data[symbol]["close"].iloc[-1])  # Garantir preço mínimo positivo
+                final_sma = max(0.00001, symbol_data[symbol]["sma"].iloc[-1])      # Garantir SMA mínimo positivo
+                final_atr = max(0, symbol_data[symbol]["atr"].iloc[-1])             # ATR não pode ser negativo
+                final_volume = max(0, symbol_data[symbol]["volume"].iloc[-1])       # Volume não pode ser negativo
+                trade.close(final_price, final_volume, final_sma, final_atr)
+                balance += trade.profit_usdt + trade.entry_cost
+                total_fees[symbol] += trade.fees
+                total_profit += trade.profit_usdt
+                backtest_trades.append(trade)
+                open_orders[symbol].remove(trade)
+                total_invested -= trade.entry_cost
+
+    # Calcular estatísticas
+    win_rate = sum(1 for t in backtest_trades if t.profit_usdt > 0) / len(backtest_trades) if backtest_trades else 0
+    total_trades = len(backtest_trades)
+    avg_trades_per_day = total_trades / total_days if total_days > 0 else 0
+    total_fees_sum = sum(total_fees.values())
+    profit_percentage = (total_profit / cumulative_invested * 100) if cumulative_invested > 0 else 0
+    avg_profit_per_day = total_profit / total_days if total_days > 0 else 0
+    max_profit_trade = max([t.profit_usdt for t in backtest_trades], default=0)
+    max_loss_trade = min([t.profit_usdt for t in backtest_trades], default=0)
+    execution_time = time.time() - start_time
+    
+    stats = {
+        "profit": total_profit,
+        "win_rate": win_rate,
+        "avg_trades_per_day": avg_trades_per_day,
+        "avg_profit_per_trade": total_profit / total_trades if total_trades > 0 else 0,
+        "volatility": np.std([t.profit_usdt for t in backtest_trades]) if backtest_trades else 0,
+        "success_freq": sum(1 for t in backtest_trades if t.profit_usdt > 0) / total_days if total_days > 0 else 0
+    }
+    
+    return total_profit, win_rate, "", total_trades, total_fees, execution_time, backtest_trades, stats, cumulative_invested, total_fees_sum, avg_trades_per_day, avg_profit_per_day, max_profit_trade, max_loss_trade
+
+def calculate_score(stats):
+    profit_score = min(1.0, stats["profit"] / TARGET_TOTAL_PROFIT) if stats["profit"] > 0 else stats["profit"] / abs(TARGET_TOTAL_PROFIT * 0.1)
+    win_rate_score = stats["win_rate"] / TARGET_WIN_RATE
+    trade_freq_score = stats["avg_trades_per_day"] / TARGET_TRADES_PER_DAY
+    volatility_penalty = min(1.0, stats["volatility"] / 5.0)
+    return 0.7 * profit_score + 0.15 * win_rate_score + 0.15 * trade_freq_score - 0.1 * volatility_penalty
+
+def load_existing_snapshots():
+    global TOP_RESULTS
+    TOP_RESULTS = []
+    snapshot_files = [f for f in os.listdir(SNAPSHOT_DIR) if f.startswith("top_") and f.endswith(".py")]
+    for file in snapshot_files:
+        match = re.match(r"top_(\d+)_score_(\d+\.\d+)(?:_(\d+))?\.py", file)
+        if match:
+            iteration = int(match.group(1))
+            score = float(match.group(2))
+            snapshot_file = os.path.join(SNAPSHOT_DIR, file)
+            try:
+                with open(snapshot_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                params = {
+                    "TAKE_PROFIT_FACTOR": float(re.search(r"TAKE_PROFIT_FACTOR = (\d+\.\d+)", content).group(1)),
+                    "STOP_LOSS_FACTOR": float(re.search(r"STOP_LOSS_FACTOR = (\d+\.\d+)", content).group(1)),
+                    "GRID_INTERVAL": float(re.search(r"GRID_INTERVAL = (\d+\.\d+)", content).group(1)),
+                    "MAX_ALLOCATION_RATIO": float(re.search(r"MAX_ALLOCATION_RATIO = (\d+\.\d+)", content).group(1)),
+                    "MIN_ATR": float(re.search(r"MIN_ATR = (\d+\.\d+)", content).group(1))
+                }
+                TOP_RESULTS.append({
+                    "iteration": iteration,
+                    "stats": {},
+                    "total_trades": 0,
+                    "score": score,
+                    "params": params,
+                    "snapshot_file": snapshot_file
+                })
+            except Exception as e:
+                logging.error(f"Erro ao carregar snapshot {file}: {e}")
+    TOP_RESULTS.sort(key=lambda x: x["score"], reverse=True)
+    TOP_RESULTS = TOP_RESULTS[:10]
+    scores_list = [f"{r['score']:.3f}" for r in TOP_RESULTS]
+    logging.info(f"Carregados {len(TOP_RESULTS)} snapshots existentes: {scores_list}")
+
+async def review_and_improve_script(iteration):
+    if iteration % SCRIPT_REVIEW_INTERVAL != 0:
+        return False
+    
+    logging.info(f"Revisando script na iteração {iteration}...")
+    current_content = open(__file__, 'r', encoding='utf-8').readlines()
+    
+    if TOP_RESULTS:
+        best_script = max(TOP_RESULTS, key=lambda x: x["score"])
+        async with aiofiles.open(best_script["snapshot_file"], 'r', encoding='utf-8') as f:
+            best_content = await f.readlines()
+    else:
+        best_content = current_content
+
+    new_script = current_content.copy()
+    close_section = []
+    evaluate_section = []
+    in_close_method = False
+    in_evaluate_symbol = False
+
+    for line in best_content:
+        stripped = line.strip()
+        if stripped == "def close(self, exit_price, volume, sma, atr):":
+            in_close_method = True
+            close_section = [line]
+        elif in_close_method and stripped == "return self.status == 'closed'":
+            close_section.append(line)
+            in_close_method = False
+        elif in_close_method:
+            close_section.append(line)
+        elif stripped == "def evaluate_symbol(close, atr, volume, sma, symbol_profit=0):":
+            in_evaluate_symbol = True
+            evaluate_section = [line]
+        elif in_evaluate_symbol and stripped == "return scores":
+            evaluate_section.append(line)
+            in_evaluate_symbol = False
+        elif in_evaluate_symbol:
+            evaluate_section.append(line)
+
+    final_script = []
+    in_close_method = False
+    in_evaluate_symbol = False
+    for line in new_script:
+        stripped = line.strip()
+        if stripped == "def close(self, exit_price, volume, sma, atr):":
+            in_close_method = True
+            final_script.extend(close_section)
+        elif in_close_method and stripped == "return self.status == 'closed'":
+            in_close_method = False
+        elif stripped == "def evaluate_symbol(close, atr, volume, sma, symbol_profit=0):":
+            in_evaluate_symbol = True
+            final_script.extend(evaluate_section)
+        elif in_evaluate_symbol and stripped == "return scores":
+            in_evaluate_symbol = False
+        elif not in_close_method and not in_evaluate_symbol:
+            if stripped.startswith("TAKE_PROFIT_FACTOR ="):
+                final_script.append(f"TAKE_PROFIT_FACTOR = {TAKE_PROFIT_FACTOR:.1f}\n")
+            elif stripped.startswith("STOP_LOSS_FACTOR ="):
+                final_script.append(f"STOP_LOSS_FACTOR = {STOP_LOSS_FACTOR:.1f}\n")
+            elif stripped.startswith("GRID_INTERVAL ="):
+                final_script.append(f"GRID_INTERVAL = {GRID_INTERVAL:.6f}\n")
+            elif stripped.startswith("MAX_ALLOCATION_RATIO ="):
+                final_script.append(f"MAX_ALLOCATION_RATIO = {MAX_ALLOCATION_RATIO:.1f}\n")
+            elif stripped.startswith("MIN_ATR ="):
+                final_script.append(f"MIN_ATR = {MIN_ATR:.6f}\n")
+            elif stripped.startswith("SYMBOLS ="):
+                final_script.append("SYMBOLS = ['XRPUSDT', 'BTCUSDT', 'ETHUSDT']\n")
+            else:
+                final_script.append(line)
+
+    new_script_str = "".join(final_script)
+    try:
+        compile(new_script_str, __file__, 'exec')
+        async with aiofiles.open(__file__, 'w', encoding='utf-8') as f:
+            await f.write(new_script_str)
+        logging.info(f"Script revisado e melhorado com sucesso na iteração {iteration}.")
+        return True
+    except SyntaxError as e:
+        logging.error(f"Erro de sintaxe ao revisar script: {e}")
+        return False
+
+async def save_script_snapshot(iteration, score, total_profit):
+    global TOP_RESULTS
+    logging.info(f"Tentando salvar snapshot: Iteração {iteration}, Score {score:.3f}, Lucro {total_profit}")
+    
+    # Criar novo resultado
+    new_result = {
+        "iteration": iteration,
+        "score": score,
+        "snapshot_file": os.path.join(SNAPSHOT_DIR, f"top_{iteration}_score_{score:.3f}.py")
+    }
+    
+    # Adicionar à lista e manter os 10 melhores
+    TOP_RESULTS.append(new_result)
+    TOP_RESULTS.sort(key=lambda x: x["score"], reverse=True)
+    if len(TOP_RESULTS) > 10:
+        worst = TOP_RESULTS.pop()
+        if os.path.exists(worst["snapshot_file"]):
+            os.remove(worst["snapshot_file"])
+            logging.info(f"Removido snapshot com score mais baixo: {worst['snapshot_file']}")
+    
+    # Salvar o novo snapshot
+    script_content = open(__file__, 'r', encoding='utf-8').read()
+    async with aiofiles.open(new_result["snapshot_file"], 'w', encoding='utf-8') as f:
+        await f.write(script_content)
+    logging.info(f"Snapshot salvo: {new_result['snapshot_file']}, Score {score:.3f}")
+    return new_result["snapshot_file"]
+
+async def optimize_parameters(stats, total_trades, backtest_trades, iteration, total_profit, win_rate, execution_time, cumulative_invested, total_fees_sum, avg_trades_per_day, avg_profit_per_day, max_profit_trade, max_loss_trade):
+    global TAKE_PROFIT_FACTOR, STOP_LOSS_FACTOR, GRID_INTERVAL, MAX_ALLOCATION_RATIO, MIN_ATR, TOP_RESULTS, RECENT_PERFORMANCE, best_profit, stagnation_counter, previous_profit, previous_avg, last_report, RECENT_PROFITS
+    
+    RECENT_PERFORMANCE.append(stats)
+    score = calculate_score(stats)
+    
+    logging.info(f"Iniciando iteração {iteration}")
+    if iteration % CHECKPOINT_INTERVAL == 0:
+        scores_list = [f"{r['score']:.3f}" for r in TOP_RESULTS]
+        logging.info(f"Checkpoint {iteration}: Top 10 Scores: {scores_list}")
+    
+    # Salvar snapshot em todas as iterações
+    await save_script_snapshot(iteration, score, total_profit)
+    
+    if stats["profit"] > best_profit:
+        best_profit = stats["profit"]
+        stagnation_counter = 0
+    else:
+        stagnation_counter += 1
+        if stagnation_counter >= STAGNATION_THRESHOLD:
+            logging.info(f"Estagnação detectada após {STAGNATION_THRESHOLD} ciclos.")
+            TAKE_PROFIT_FACTOR = random.uniform(1.0, 2.0)
+            STOP_LOSS_FACTOR = random.uniform(1.5, 2.5)
+            GRID_INTERVAL = random.uniform(0.00001, 0.00003)
+            MAX_ALLOCATION_RATIO = random.uniform(0.6, 0.8)
+            MIN_ATR = random.uniform(0.00001, 0.00003)
+            stagnation_counter = 0
+        elif random.random() < 0.1:
+            logging.info("Simulated Annealing: Aceitando solução temporariamente pior.")
+            TAKE_PROFIT_FACTOR = random.uniform(1.0, 2.0)
+            STOP_LOSS_FACTOR = random.uniform(1.5, 2.5)
+            GRID_INTERVAL = random.uniform(0.00001, 0.00003)
+            MAX_ALLOCATION_RATIO = random.uniform(0.6, 0.8)
+            MIN_ATR = random.uniform(0.00001, 0.00003)
+
+    if iteration % RANDOMIZATION_INTERVAL == 0 and iteration > 0:
+        logging.info(f"Randomizando parâmetros na iteração {iteration}")
+        TAKE_PROFIT_FACTOR = random.uniform(1.0, 2.0)
+        STOP_LOSS_FACTOR = random.uniform(1.5, 2.5)
+        GRID_INTERVAL = random.uniform(0.00001, 0.00003)
+        MAX_ALLOCATION_RATIO = random.uniform(0.6, 0.8)
+        MIN_ATR = random.uniform(0.00001, 0.00003)
+
+    RECENT_PROFITS.append(total_profit)
+    if len(RECENT_PROFITS) == 10:
+        recent_avg = sum(RECENT_PROFITS) / 10
+        if recent_avg < previous_avg * 0.9 and iteration > 10:
+            logging.info("Tendência de queda detectada.")
+            TAKE_PROFIT_FACTOR = random.uniform(1.0, 2.0)
+            STOP_LOSS_FACTOR = random.uniform(1.5, 2.5)
+            GRID_INTERVAL = random.uniform(0.00001, 0.00003)
+            MAX_ALLOCATION_RATIO = random.uniform(0.6, 0.8)
+            MIN_ATR = random.uniform(0.00001, 0.00003)
+        previous_avg = recent_avg
+
+    profit_gap = TARGET_TOTAL_PROFIT - stats["profit"]
+    win_rate_gap = TARGET_WIN_RATE - stats["win_rate"]
+    trade_count_deficit = TARGET_TRADES_PER_DAY - stats["avg_trades_per_day"]
+    
+    if profit_gap > 0:
+        TAKE_PROFIT_FACTOR += random.uniform(0.1, 0.3)
+    if win_rate_gap > 0:
+        STOP_LOSS_FACTOR = min(STOP_LOSS_FACTOR + random.uniform(0.1, 0.3), 2.5)
+    if trade_count_deficit > 0:
+        GRID_INTERVAL = max(0.00001, GRID_INTERVAL * random.uniform(0.5, 0.9))
+        MAX_ALLOCATION_RATIO = min(MAX_ALLOCATION_RATIO + random.uniform(0.05, 0.1), 0.8)
+    
+    TAKE_PROFIT_FACTOR = min(max(TAKE_PROFIT_FACTOR, 1.0), 2.0)
+    STOP_LOSS_FACTOR = min(max(STOP_LOSS_FACTOR, 1.5), 2.5)
+    GRID_INTERVAL = min(max(GRID_INTERVAL, 0.00001), 0.00003)
+    MAX_ALLOCATION_RATIO = min(max(MAX_ALLOCATION_RATIO, 0.6), 0.8)
+    MIN_ATR = min(max(MIN_ATR, 0.00001), 0.00003)
+    
+    logging.info(f"Novos parâmetros: TAKE_PROFIT_FACTOR={TAKE_PROFIT_FACTOR:.2f}, STOP_LOSS_FACTOR={STOP_LOSS_FACTOR:.2f}")
+    success = await validate_and_modify_script(stats["profit"], stats["win_rate"], stats["avg_trades_per_day"], iteration)
+    if not success:
+        logging.warning("Falha na modificação.")
+    
+    previous_profit = total_profit
+    
+    profit_percentage = (total_profit / cumulative_invested * 100) if cumulative_invested > 0 else 0
+    report_lines = [
+        f'Resumo do Backtest "{iteration}" / Score = {score:.3f}',
+        f"Lucro: ${total_profit:.2f}, Win Rate: {win_rate*100:.2f}%, Trades: {total_trades}, Tempo: {execution_time:.2f}s",
+        "=" * 40,
+        f"  Saldo Inicial           : ${current_balance:>10.2f}",
+        f"  Lucro Total             : ${total_profit:>10.2f}",
+        f"  Taxa de Acerto          : {win_rate:>10.2%}",
+        f"  Total de Trades         : {total_trades:>10}",
+        f"  Total Investido         : ${cumulative_invested:>10.2f}",
+        f"  Lucro em % do Investido : {profit_percentage:>10.2f}%",
+        f"  Total Gasto em Taxas    : ${total_fees_sum:>10.2f}",
+        f"  Média de Trades/Dia     : {avg_trades_per_day:>10.2f}",
+        f"  Lucro Médio por Dia     : ${avg_profit_per_day:>10.2f}",
+        f"  Maior Lucro por Ordem   : ${max_profit_trade:>10.2f}",
+        f"  Maior Perda por Ordem   : ${max_loss_trade:>10.2f}",
+        f"  Tempo de Execução       : {execution_time:>10.2f}s",
+        "=" * 40,
+        ""
+    ]
+    last_report = "\n".join(report_lines)
+    print(last_report)
+
+async def validate_and_modify_script(profit, win_rate, avg_trades_per_day, iteration):
+    global TAKE_PROFIT_FACTOR, STOP_LOSS_FACTOR, GRID_INTERVAL, MAX_ALLOCATION_RATIO, MIN_ATR
+    
+    original_file = __file__
+    shutil.copyfile(original_file, BACKUP_FILE)
+    
+    with open(original_file, 'r', encoding='utf-8') as f:
+        original_content = f.read()
+    
+    params_section = f"""TAKE_PROFIT_FACTOR = {TAKE_PROFIT_FACTOR:.1f}
+STOP_LOSS_FACTOR = {STOP_LOSS_FACTOR:.1f}
+GRID_INTERVAL = {GRID_INTERVAL:.6f}
+MAX_ALLOCATION_RATIO = {MAX_ALLOCATION_RATIO:.1f}
+MIN_ATR = {MIN_ATR:.6f}
+SYMBOLS = {SYMBOLS}
+"""
+    
+    lines = original_content.splitlines(True)
+    new_script = []
+    in_params = False
+    params_start = None
+    params_end = None
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("TAKE_PROFIT_FACTOR ="):
+            in_params = True
+            params_start = i
+        elif in_params and stripped.startswith("SYMBOLS ="):
+            params_end = i + 1
+            break
+    
+    if params_start is not None and params_end is not None:
+        new_script = lines[:params_start] + [params_section] + lines[params_end:]
+    else:
+        new_script = [params_section] + lines
+    
+    new_script_str = "".join(new_script)
+    try:
+        compile(new_script_str, original_file, 'exec')
+        async with aiofiles.open(__file__, 'w', encoding='utf-8') as f:
+            await f.write(new_script_str)
+        logging.info(f"Script modificado com sucesso na iteração {iteration}.")
+        return True
+    except SyntaxError as e:
+        logging.error(f"Erro de sintaxe ao modificar o script: {e}")
+        shutil.copyfile(BACKUP_FILE, original_file)
+        return False
+
+async def evolution_loop():
+    global previous_profit, last_report, previous_avg, data_loaded, TOP_RESULTS
+    iteration = 0
+    load_existing_snapshots()
+    data_loaded = False
+    try:
+        while True:
+            iteration += 1
+            global current_balance
+            current_balance = 50.0
+            
+            if last_report:
+                logging.info(last_report)
+            
+            total_profit, win_rate, _, total_trades, total_fees, execution_time, backtest_trades, stats, cumulative_invested, total_fees_sum, avg_trades_per_day, avg_profit_per_day, max_profit_trade, max_loss_trade = await backtest_strategy()
+            await optimize_parameters(stats, total_trades, backtest_trades, iteration, total_profit, win_rate, execution_time, cumulative_invested, total_fees_sum, avg_trades_per_day, avg_profit_per_day, max_profit_trade, max_loss_trade)
+            await asyncio.sleep(0.005)
+    except KeyboardInterrupt:
+        logging.info("Execução interrompida pelo usuário.")
+        scores_list = [f"{r['score']:.3f}" for r in TOP_RESULTS]
+        logging.info(f"Top 10 Scores finais: {scores_list}")
+        if last_report:
+            print(last_report)
+
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(evolution_loop())
+    except KeyboardInterrupt:
+        print("\nExecução interrompida pelo usuário.")
+    except Exception as e:
+        print(f"Erro inesperado: {e}")
+        raise
