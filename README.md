@@ -2,6 +2,8 @@
 
 analise de ativos
 
+executa pelo yanbacktest.py
+
 cuidado que ele cria 2 pastas no diretório.
 
 tenta executar e código e me diz oq achou.
